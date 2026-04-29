@@ -137,11 +137,15 @@ def run_episode(
     log_dir: Path | None,
     verbose: bool,
     llm: Any | None = None,
+    max_tool_iterations: int = 20,
 ) -> EpisodeResult:
     rng = random.Random(seed)
     env = Game2048Env(seed=seed, agent_id="Agent")
     policy = POLICIES.get(policy_name)
-    planner = build_planner(env, llm, "Agent") if policy_name == "llm" else None
+    planner = (
+        build_planner(env, llm, "Agent", max_tool_iterations=max_tool_iterations)
+        if policy_name == "llm" else None
+    )
     actor = Actor()
     feedback_processor = FeedbackProcessor()
     memory = MemoryStore(max_short_term=80)
@@ -273,6 +277,7 @@ def run(args: argparse.Namespace) -> None:
             log_dir=log_dir,
             verbose=args.verbose or args.policy == "interactive",
             llm=llm,
+            max_tool_iterations=args.max_tool_iterations,
         )
         for episode in range(args.episodes)
     ]
@@ -297,6 +302,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--log-dir", default=None)
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument(
+        "--max-tool-iterations",
+        type=int,
+        default=20,
+        help="Cap on ReAct iterations per LLM turn. Default 20.",
+    )
     add_llm_args(parser)
     return parser.parse_args()
 

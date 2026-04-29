@@ -138,7 +138,12 @@ class Planner:
         used to compute per-action consequences and embed them in the
         prompt. Wire ``GameEnvironment.preview`` through here.
     max_tool_iterations
-        Hard cap on ReAct iterations when tools are present. Default: 8.
+        Hard cap on ReAct iterations when tools are present. Default: 20.
+        Each iteration is one round-trip with the model; some backends
+        (notably DeepSeek) do not always return parallel tool calls, so a
+        small budget is exhausted quickly on games with rich tool usage
+        such as Mastermind. The planner emits a final budget warning to
+        the model on the second-to-last iteration so it can commit cleanly.
     """
 
     def __init__(
@@ -150,7 +155,7 @@ class Planner:
         system: str | None = None,
         tools: ToolRegistry | None = None,
         preview_callable: PreviewCallable | None = None,
-        max_tool_iterations: int = 8,
+        max_tool_iterations: int = 20,
     ) -> None:
         self._llm = llm
         self._simulate = simulate_before_plan
@@ -333,7 +338,15 @@ class Planner:
         registry.register(_submit_plan_definition(action_types), _submit_plan)
 
         # Seed the conversation with the prompt as a single user message.
-        messages: list[dict] = [{"role": "user", "content": prompt}]
+        budget_intro = (
+            f"\n\nYou have a tool-call budget of {self._max_tool_iter} "
+            "iterations for this turn. Use research tools sparingly and "
+            "call submit_plan as soon as you have enough information to "
+            "decide. If submit_plan validation fails, the error message "
+            "is returned to you and you can call it again with corrected "
+            "arguments."
+        )
+        messages: list[dict] = [{"role": "user", "content": prompt + budget_intro}]
 
         for iteration in range(1, self._max_tool_iter + 1):
             try:
@@ -377,6 +390,21 @@ class Planner:
 
             if "plan" in captured:
                 break
+
+            # On the second-to-last iteration, nudge the model to commit.
+            # Inject the warning as a synthetic user message so it's visible
+            # before the next assistant turn.
+            remaining = self._max_tool_iter - iteration
+            if remaining == 1:
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "BUDGET WARNING: only 1 tool-call iteration remains. "
+                        "Call submit_plan now with your best decision — if "
+                        "you do not, a fallback action will be selected for "
+                        "you."
+                    ),
+                })
 
         if "plan" not in captured:
             log.warning(

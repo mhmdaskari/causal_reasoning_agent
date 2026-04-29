@@ -32,7 +32,7 @@ def build_planner(
     agent_id: str = "Agent",
     *,
     simulate_before_plan: bool = False,
-    max_tool_iterations: int = 8,
+    max_tool_iterations: int = 20,
 ) -> Planner:
     """
     Build a ``Planner`` configured from the env's optional hooks.
