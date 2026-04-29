@@ -1,7 +1,7 @@
 """causal_agent — LLM-agnostic agentic framework for social games."""
 
 from causal_agent.kripke import KripkeModel, World
-from causal_agent.llm import BaseLLM, MockLLM, OpenAILLM, AnthropicLLM, GeminiLLM
+from causal_agent.llm import BaseLLM, MockLLM, OpenAILLM, AnthropicLLM, GeminiLLM, DeepSeekLLM
 from causal_agent.memory import MemoryStore, MemoryEntry
 from causal_agent.feedback import FeedbackProcessor, FeedbackEvent, FeedbackKind
 from causal_agent.planning import Planner, Plan
@@ -12,7 +12,7 @@ __all__ = [
     # kripke
     "KripkeModel", "World",
     # llm
-    "BaseLLM", "MockLLM", "OpenAILLM", "AnthropicLLM", "GeminiLLM",
+    "BaseLLM", "MockLLM", "OpenAILLM", "AnthropicLLM", "GeminiLLM", "DeepSeekLLM",
     # memory
     "MemoryStore", "MemoryEntry",
     # feedback

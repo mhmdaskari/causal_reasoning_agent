@@ -13,6 +13,7 @@ MockLLM       – deterministic/canned responses; no API key needed (tests, demo
 OpenAILLM     – OpenAI chat completions (gpt-4o, etc.).
 AnthropicLLM  – Anthropic messages API (claude-3-5-sonnet, etc.).
 GeminiLLM     – Google Gemini generative AI (gemini-2.0-flash, etc.).
+DeepSeekLLM   – DeepSeek API via OpenAI-compatible interface (deepseek-chat, etc.).
 """
 
 from __future__ import annotations
@@ -243,3 +244,69 @@ class GeminiLLM(BaseLLM):
 
     def __repr__(self) -> str:
         return f"GeminiLLM(model={self._model_name!r})"
+
+
+# ---------------------------------------------------------------------------
+# DeepSeek — OpenAI-compatible endpoint
+# ---------------------------------------------------------------------------
+
+class DeepSeekLLM(BaseLLM):
+    """
+    Thin wrapper around the DeepSeek API using the OpenAI-compatible interface.
+
+    DeepSeek exposes an OpenAI-compatible REST endpoint, so we reuse the
+    openai SDK pointed at https://api.deepseek.com/v1.
+
+    Parameters
+    ----------
+    model   : DeepSeek model slug, e.g. "deepseek-chat" or "deepseek-reasoner".
+    api_key : if None, reads DEEPSEEK_API_KEY from the environment.
+    kwargs  : forwarded to every chat.completions.create() call.
+    """
+
+    _BASE_URL = "https://api.deepseek.com/v1"
+
+    def __init__(
+        self,
+        model: str = "deepseek-chat",
+        api_key: str | None = None,
+        **default_kwargs,
+    ) -> None:
+        import os
+        try:
+            from openai import OpenAI
+        except ImportError as exc:
+            raise ImportError("pip install openai") from exc
+
+        resolved_key = api_key or os.getenv("DEEPSEEK_API_KEY")
+        if not resolved_key:
+            raise ValueError(
+                "DeepSeek API key not found. "
+                "Pass api_key= or set DEEPSEEK_API_KEY in your environment."
+            )
+
+        self._client = OpenAI(api_key=resolved_key, base_url=self._BASE_URL)
+        self._model = model
+        self._defaults = default_kwargs
+
+    def complete(self, prompt: str, system: str = "", **kwargs) -> str:
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+
+        params = {
+            "temperature": 0.7,
+            "max_tokens": 1000,
+            **self._defaults,
+            **kwargs,
+        }
+        resp = self._client.chat.completions.create(
+            model=self._model,
+            messages=messages,
+            **params,
+        )
+        return resp.choices[0].message.content or ""
+
+    def __repr__(self) -> str:
+        return f"DeepSeekLLM(model={self._model!r})"
