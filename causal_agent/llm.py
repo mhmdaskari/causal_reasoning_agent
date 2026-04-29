@@ -18,9 +18,13 @@ DeepSeekLLM   – DeepSeek API via OpenAI-compatible interface (deepseek-chat, e
 
 from __future__ import annotations
 
+import json
 from abc import ABC, abstractmethod
 from itertools import cycle
-from typing import Iterator
+from typing import Iterator, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from causal_agent.tools import LLMResponse, ToolRegistry
 
 
 # ---------------------------------------------------------------------------
@@ -40,6 +44,28 @@ class BaseLLM(ABC):
 
     @abstractmethod
     def complete(self, prompt: str, system: str = "", **kwargs) -> str: ...
+
+    def complete_with_tools(
+        self,
+        messages: list[dict],
+        registry: "ToolRegistry",
+        system: str = "",
+        **kwargs,
+    ) -> "LLMResponse":
+        """
+        Single-turn completion with tool-calling support.
+
+        Returns an LLMResponse with either:
+        - tool_calls populated  → caller should execute tools and loop.
+        - content populated     → model is done; this is the final answer.
+
+        Subclasses override this to use native function-calling APIs.
+        The default raises NotImplementedError; use a backend that supports it.
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not implement complete_with_tools(). "
+            "Use OpenAILLM, DeepSeekLLM, AnthropicLLM, or GeminiLLM."
+        )
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}()"
@@ -82,6 +108,11 @@ class MockLLM(BaseLLM):
 
     def complete(self, prompt: str, system: str = "", **kwargs) -> str:
         return next(self._cycle)
+
+    def complete_with_tools(self, messages, registry, system="", **kwargs):
+        from causal_agent.tools import LLMResponse
+        # In mock mode just return the next canned string as a final response.
+        return LLMResponse(content=next(self._cycle))
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +158,33 @@ class OpenAILLM(BaseLLM):
             **params,
         )
         return resp.choices[0].message.content or ""
+
+    def complete_with_tools(self, messages, registry, system="", **kwargs):
+        from causal_agent.tools import LLMResponse, ToolCall
+
+        all_messages = []
+        if system:
+            all_messages.append({"role": "system", "content": system})
+        all_messages.extend(messages)
+
+        params = {**self._defaults, **kwargs}
+        resp = self._client.chat.completions.create(
+            model=self._model,
+            messages=all_messages,
+            tools=registry.openai_schemas(),
+            **params,
+        )
+        msg = resp.choices[0].message
+        if msg.tool_calls:
+            return LLMResponse(tool_calls=[
+                ToolCall(
+                    id=tc.id,
+                    name=tc.function.name,
+                    arguments=json.loads(tc.function.arguments),
+                )
+                for tc in msg.tool_calls
+            ])
+        return LLMResponse(content=msg.content or "")
 
     def __repr__(self) -> str:
         return f"OpenAILLM(model={self._model!r})"
@@ -178,6 +236,38 @@ class AnthropicLLM(BaseLLM):
 
         resp = self._client.messages.create(**params)
         return resp.content[0].text if resp.content else ""
+
+    def complete_with_tools(self, messages, registry, system="", **kwargs):
+        from causal_agent.tools import LLMResponse, ToolCall
+
+        params: dict = {
+            "model": self._model,
+            "max_tokens": kwargs.pop("max_tokens", self._max_tokens),
+            "messages": messages,
+            "tools": registry.anthropic_schemas(),
+            **self._defaults,
+            **kwargs,
+        }
+        if system:
+            params["system"] = system
+
+        resp = self._client.messages.create(**params)
+
+        tool_calls = []
+        text_content = None
+        for block in resp.content:
+            if block.type == "tool_use":
+                tool_calls.append(ToolCall(
+                    id=block.id,
+                    name=block.name,
+                    arguments=block.input,
+                ))
+            elif block.type == "text":
+                text_content = block.text
+
+        if tool_calls:
+            return LLMResponse(tool_calls=tool_calls)
+        return LLMResponse(content=text_content or "")
 
     def __repr__(self) -> str:
         return f"AnthropicLLM(model={self._model!r})"
@@ -236,11 +326,53 @@ class GeminiLLM(BaseLLM):
         params = {**self._defaults, **kwargs}
         config = self._genai.types.GenerationConfig(**params) if params else None
 
-        resp = model.generate_content(
-            prompt,
-            generation_config=config,
-        )
+        resp = model.generate_content(prompt, generation_config=config)
         return resp.text if resp.text else ""
+
+    def complete_with_tools(self, messages, registry, system="", **kwargs):
+        from causal_agent.tools import LLMResponse, ToolCall
+
+        tools = [{"function_declarations": registry.gemini_schemas()}]
+        model = self._genai.GenerativeModel(
+            model_name=self._model_name,
+            system_instruction=system or None,
+            tools=tools,
+        )
+
+        # Convert OpenAI-style message dicts to Gemini Content objects.
+        gemini_history = []
+        last_user_parts = None
+        for msg in messages:
+            role = "user" if msg["role"] == "user" else "model"
+            content = msg.get("content") or ""
+            gemini_history.append({"role": role, "parts": [content]})
+
+        # Gemini uses a chat session for multi-turn; send the last user turn.
+        if gemini_history and gemini_history[-1]["role"] == "user":
+            last_user_parts = gemini_history[-1]["parts"]
+            history = gemini_history[:-1]
+        else:
+            last_user_parts = [""]
+            history = gemini_history
+
+        chat = model.start_chat(history=history)
+        params = {**self._defaults, **kwargs}
+        config = self._genai.types.GenerationConfig(**params) if params else None
+        resp = chat.send_message(last_user_parts, generation_config=config)
+
+        tool_calls = []
+        for part in resp.parts:
+            fc = getattr(part, "function_call", None)
+            if fc:
+                tool_calls.append(ToolCall(
+                    id=fc.name,   # Gemini has no call ID; use name as surrogate
+                    name=fc.name,
+                    arguments=dict(fc.args),
+                ))
+
+        if tool_calls:
+            return LLMResponse(tool_calls=tool_calls)
+        return LLMResponse(content=resp.text if resp.text else "")
 
     def __repr__(self) -> str:
         return f"GeminiLLM(model={self._model_name!r})"
@@ -307,6 +439,38 @@ class DeepSeekLLM(BaseLLM):
             **params,
         )
         return resp.choices[0].message.content or ""
+
+    def complete_with_tools(self, messages, registry, system="", **kwargs):
+        from causal_agent.tools import LLMResponse, ToolCall
+
+        all_messages = []
+        if system:
+            all_messages.append({"role": "system", "content": system})
+        all_messages.extend(messages)
+
+        params = {
+            "temperature": 0.7,
+            "max_tokens": 1000,
+            **self._defaults,
+            **kwargs,
+        }
+        resp = self._client.chat.completions.create(
+            model=self._model,
+            messages=all_messages,
+            tools=registry.openai_schemas(),
+            **params,
+        )
+        msg = resp.choices[0].message
+        if msg.tool_calls:
+            return LLMResponse(tool_calls=[
+                ToolCall(
+                    id=tc.id,
+                    name=tc.function.name,
+                    arguments=json.loads(tc.function.arguments),
+                )
+                for tc in msg.tool_calls
+            ])
+        return LLMResponse(content=msg.content or "")
 
     def __repr__(self) -> str:
         return f"DeepSeekLLM(model={self._model!r})"
