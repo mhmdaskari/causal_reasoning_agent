@@ -19,12 +19,15 @@ DeepSeekLLM   – DeepSeek API via OpenAI-compatible interface (deepseek-chat, e
 from __future__ import annotations
 
 import json
+import logging
 from abc import ABC, abstractmethod
 from itertools import cycle
 from typing import Iterator, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from causal_agent.tools import LLMResponse, ToolRegistry
+
+log = logging.getLogger("causal_agent.llm")
 
 
 # ---------------------------------------------------------------------------
@@ -44,6 +47,38 @@ class BaseLLM(ABC):
 
     @abstractmethod
     def complete(self, prompt: str, system: str = "", **kwargs) -> str: ...
+
+    # ------------------------------------------------------------------
+    # Logging helpers (call these inside subclass implementations)
+    # ------------------------------------------------------------------
+
+    def _log_request(self, prompt_or_messages: object, system: str = "") -> None:
+        if log.isEnabledFor(logging.DEBUG):
+            text = str(prompt_or_messages)
+            log.debug(
+                "%r  →  system=%r  input=%.400s%s",
+                self,
+                system[:120] if system else "",
+                text,
+                "…" if len(text) > 400 else "",
+            )
+
+    def _log_response(self, content: str, kind: str = "complete") -> None:
+        log.info("%r  ←  [%s]  %d chars", self, kind, len(content))
+        if log.isEnabledFor(logging.DEBUG):
+            log.debug(
+                "%r  ←  %.500s%s",
+                self,
+                content,
+                "…" if len(content) > 500 else "",
+            )
+
+    def _log_tool_calls(self, tool_calls: list) -> None:
+        names = [tc.name for tc in tool_calls]
+        log.info("%r  ←  [tool_calls]  %s", self, names)
+        if log.isEnabledFor(logging.DEBUG):
+            for tc in tool_calls:
+                log.debug("%r      call  %s(%s)", self, tc.name, tc.arguments)
 
     def complete_with_tools(
         self,
@@ -107,12 +142,17 @@ class MockLLM(BaseLLM):
         )
 
     def complete(self, prompt: str, system: str = "", **kwargs) -> str:
-        return next(self._cycle)
+        self._log_request(prompt, system)
+        result = next(self._cycle)
+        self._log_response(result)
+        return result
 
     def complete_with_tools(self, messages, registry, system="", **kwargs):
         from causal_agent.tools import LLMResponse
-        # In mock mode just return the next canned string as a final response.
-        return LLMResponse(content=next(self._cycle))
+        self._log_request(messages, system)
+        content = next(self._cycle)
+        self._log_response(content, kind="mock_final")
+        return LLMResponse(content=content)
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +186,7 @@ class OpenAILLM(BaseLLM):
         self._defaults = default_kwargs
 
     def complete(self, prompt: str, system: str = "", **kwargs) -> str:
+        self._log_request(prompt, system)
         messages = []
         if system:
             messages.append({"role": "system", "content": system})
@@ -153,14 +194,15 @@ class OpenAILLM(BaseLLM):
 
         params = {**self._defaults, **kwargs}
         resp = self._client.chat.completions.create(
-            model=self._model,
-            messages=messages,
-            **params,
+            model=self._model, messages=messages, **params,
         )
-        return resp.choices[0].message.content or ""
+        result = resp.choices[0].message.content or ""
+        self._log_response(result)
+        return result
 
     def complete_with_tools(self, messages, registry, system="", **kwargs):
         from causal_agent.tools import LLMResponse, ToolCall
+        self._log_request(messages, system)
 
         all_messages = []
         if system:
@@ -176,15 +218,16 @@ class OpenAILLM(BaseLLM):
         )
         msg = resp.choices[0].message
         if msg.tool_calls:
-            return LLMResponse(tool_calls=[
-                ToolCall(
-                    id=tc.id,
-                    name=tc.function.name,
-                    arguments=json.loads(tc.function.arguments),
-                )
+            tcs = [
+                ToolCall(id=tc.id, name=tc.function.name,
+                         arguments=json.loads(tc.function.arguments))
                 for tc in msg.tool_calls
-            ])
-        return LLMResponse(content=msg.content or "")
+            ]
+            self._log_tool_calls(tcs)
+            return LLMResponse(tool_calls=tcs)
+        result = msg.content or ""
+        self._log_response(result)
+        return LLMResponse(content=result)
 
     def __repr__(self) -> str:
         return f"OpenAILLM(model={self._model!r})"
@@ -224,6 +267,7 @@ class AnthropicLLM(BaseLLM):
         self._defaults = default_kwargs
 
     def complete(self, prompt: str, system: str = "", **kwargs) -> str:
+        self._log_request(prompt, system)
         params: dict = {
             "model": self._model,
             "max_tokens": kwargs.pop("max_tokens", self._max_tokens),
@@ -235,10 +279,13 @@ class AnthropicLLM(BaseLLM):
             params["system"] = system
 
         resp = self._client.messages.create(**params)
-        return resp.content[0].text if resp.content else ""
+        result = resp.content[0].text if resp.content else ""
+        self._log_response(result)
+        return result
 
     def complete_with_tools(self, messages, registry, system="", **kwargs):
         from causal_agent.tools import LLMResponse, ToolCall
+        self._log_request(messages, system)
 
         params: dict = {
             "model": self._model,
@@ -257,16 +304,14 @@ class AnthropicLLM(BaseLLM):
         text_content = None
         for block in resp.content:
             if block.type == "tool_use":
-                tool_calls.append(ToolCall(
-                    id=block.id,
-                    name=block.name,
-                    arguments=block.input,
-                ))
+                tool_calls.append(ToolCall(id=block.id, name=block.name, arguments=block.input))
             elif block.type == "text":
                 text_content = block.text
 
         if tool_calls:
+            self._log_tool_calls(tool_calls)
             return LLMResponse(tool_calls=tool_calls)
+        self._log_response(text_content or "")
         return LLMResponse(content=text_content or "")
 
     def __repr__(self) -> str:
@@ -315,6 +360,7 @@ class GeminiLLM(BaseLLM):
         self._model = genai.GenerativeModel(model_name=model)
 
     def complete(self, prompt: str, system: str = "", **kwargs) -> str:
+        self._log_request(prompt, system)
         if system:
             model = self._genai.GenerativeModel(
                 model_name=self._model_name,
@@ -327,7 +373,9 @@ class GeminiLLM(BaseLLM):
         config = self._genai.types.GenerationConfig(**params) if params else None
 
         resp = model.generate_content(prompt, generation_config=config)
-        return resp.text if resp.text else ""
+        result = resp.text if resp.text else ""
+        self._log_response(result)
+        return result
 
     def complete_with_tools(self, messages, registry, system="", **kwargs):
         from causal_agent.tools import LLMResponse, ToolCall
@@ -371,8 +419,11 @@ class GeminiLLM(BaseLLM):
                 ))
 
         if tool_calls:
+            self._log_tool_calls(tool_calls)
             return LLMResponse(tool_calls=tool_calls)
-        return LLMResponse(content=resp.text if resp.text else "")
+        result = resp.text if resp.text else ""
+        self._log_response(result)
+        return LLMResponse(content=result)
 
     def __repr__(self) -> str:
         return f"GeminiLLM(model={self._model_name!r})"
@@ -422,38 +473,30 @@ class DeepSeekLLM(BaseLLM):
         self._defaults = default_kwargs
 
     def complete(self, prompt: str, system: str = "", **kwargs) -> str:
+        self._log_request(prompt, system)
         messages = []
         if system:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
 
-        params = {
-            "temperature": 0.7,
-            "max_tokens": 1000,
-            **self._defaults,
-            **kwargs,
-        }
+        params = {"temperature": 0.7, "max_tokens": 1000, **self._defaults, **kwargs}
         resp = self._client.chat.completions.create(
-            model=self._model,
-            messages=messages,
-            **params,
+            model=self._model, messages=messages, **params,
         )
-        return resp.choices[0].message.content or ""
+        result = resp.choices[0].message.content or ""
+        self._log_response(result)
+        return result
 
     def complete_with_tools(self, messages, registry, system="", **kwargs):
         from causal_agent.tools import LLMResponse, ToolCall
+        self._log_request(messages, system)
 
         all_messages = []
         if system:
             all_messages.append({"role": "system", "content": system})
         all_messages.extend(messages)
 
-        params = {
-            "temperature": 0.7,
-            "max_tokens": 1000,
-            **self._defaults,
-            **kwargs,
-        }
+        params = {"temperature": 0.7, "max_tokens": 1000, **self._defaults, **kwargs}
         resp = self._client.chat.completions.create(
             model=self._model,
             messages=all_messages,
@@ -462,15 +505,16 @@ class DeepSeekLLM(BaseLLM):
         )
         msg = resp.choices[0].message
         if msg.tool_calls:
-            return LLMResponse(tool_calls=[
-                ToolCall(
-                    id=tc.id,
-                    name=tc.function.name,
-                    arguments=json.loads(tc.function.arguments),
-                )
+            tcs = [
+                ToolCall(id=tc.id, name=tc.function.name,
+                         arguments=json.loads(tc.function.arguments))
                 for tc in msg.tool_calls
-            ])
-        return LLMResponse(content=msg.content or "")
+            ]
+            self._log_tool_calls(tcs)
+            return LLMResponse(tool_calls=tcs)
+        result = msg.content or ""
+        self._log_response(result)
+        return LLMResponse(content=result)
 
     def __repr__(self) -> str:
         return f"DeepSeekLLM(model={self._model!r})"

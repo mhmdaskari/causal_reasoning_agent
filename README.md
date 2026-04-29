@@ -40,13 +40,15 @@ causal_reasoning_agent/
 │   ├── kripke_tools.py         # KripkeToolset — KripkeModel ops as LLM-callable tools
 │   ├── llm.py                  # BaseLLM + adapters: Mock, OpenAI, Anthropic, Gemini, DeepSeek
 │   ├── tools.py                # ToolDefinition, ToolCall, LLMResponse, ToolRegistry
+│   ├── research_tools.py       # ResearchTools — Tavily (web_search) + Jina (fetch_page)
+│   ├── research_planner.py     # ResearchPlanner — ReAct planning loop, PlanningResult
+│   ├── human_interface.py      # HumanInterface — human_notify / human_ask / human_confirm
 │   ├── memory.py               # MemoryStore, KripkeSnapshot
 │   ├── feedback.py             # FeedbackEvent, FeedbackProcessor
-│   ├── research_tools.py       # ResearchTools — Tavily (web_search) + Jina (fetch_page)
-│   ├── research_planner.py     # ResearchPlanner — ReAct loop, PlanningResult
 │   ├── planning.py             # Plan, Planner — Kripke-grounded reactive planning
 │   ├── acting.py               # GameAction, Actor — validates + packages actions
-│   └── orchestration.py        # Orchestrator — reactive session loop
+│   ├── orchestration.py        # Orchestrator — reactive session loop
+│   └── log_config.py           # setup_logging(), get_logger()
 ├── games/
 │   ├── base.py                 # GameEnvironment ABC
 │   └── werewolf/env.py         # Werewolf implementation
@@ -93,7 +95,7 @@ class BaseLLM(ABC):
     ) -> LLMResponse: ...
 ```
 
-`LLMResponse` carries either `tool_calls` (model wants to invoke a tool — caller executes and loops) or `content` (model is done). `DeepSeekLLM` reuses the `openai` SDK pointed at `https://api.deepseek.com/v1` — no extra dependency.
+`LLMResponse` carries either `tool_calls` (model wants to invoke a tool — caller executes and loops) or `content` (model is done). Every backend logs completions via the framework logger — see **Logging** below. `DeepSeekLLM` reuses the `openai` SDK pointed at `https://api.deepseek.com/v1` — no extra dependency.
 
 ---
 
@@ -114,10 +116,10 @@ The framework has two orchestration layers. The **planning phase** handles delib
 │  │                                                  │   │
 │  │  goal → decompose into sub-goals                 │   │
 │  │       → call tools to fill knowledge gaps:       │   │
-│  │           • external  — web_search, fetch_page   │   │
-│  │           • epistemic — kripke_simulate,         │   │
-│  │                         kripke_enumerate_worlds, │   │
-│  │                         kripke_inspect_world … │   │
+│  │           • research   — web_search, fetch_page  │   │
+│  │           • epistemic  — kripke_simulate,        │   │
+│  │                          kripke_enumerate_worlds │   │
+│  │           • human      — human_notify, human_ask │   │
 │  │       → recurse until confident                  │   │
 │  │       → emit Plan artifact                       │   │
 │  └──────────────────────────────────────────────────┘   │
@@ -137,15 +139,43 @@ The framework has two orchestration layers. The **planning phase** handles delib
 
 The planning phase is **eval-agnostic** — it knows only a goal, a `ToolRegistry`, and an optional skill library. Evals inject their own tools and reference docs at init; the core framework has no knowledge of any specific domain.
 
+### Minimal wiring
+
+```python
+from causal_agent import (
+    setup_logging, DeepSeekLLM, ToolRegistry,
+    ResearchTools, KripkeToolset, HumanInterface,
+    ResearchPlanner, MemoryStore,
+)
+
+setup_logging("INFO")          # or "DEBUG" to see full prompts + responses
+
+llm      = DeepSeekLLM()
+memory   = MemoryStore()       # shared across planning + execution + all attempts
+registry = ToolRegistry()
+
+ResearchTools().register_all(registry)               # web_search, fetch_page
+KripkeToolset(lambda: model_ref[0]).register_all(registry)  # kripke_*
+HumanInterface().register_all(registry)              # human_notify, human_ask, human_confirm
+
+planner = ResearchPlanner(
+    llm=llm,
+    registry=registry,
+    system_prompt=eval_instructions,   # loaded from ksp_eval/ or similar
+    skill_docs=skill_docs,             # loaded from skills/
+    memory=memory,
+)
+result = planner.run(goal="Achieve a stable Mun orbit")
+print(result.plan)
+```
+
 ---
 
 ## Tool system
 
-Tools are the mechanism by which the agent extends its own reasoning — both outward into the world (research) and inward into its own belief state (epistemic inspection). All tools share the same `ToolRegistry` / `ToolDefinition` / `ToolCall` interface; the planning loop calls `complete_with_tools()` and dispatches results the same way regardless of tool type.
+Tools are the mechanism by which the agent extends its own reasoning — outward into the world (research), inward into its belief state (epistemic), and outward to the human operator. All tools share the same `ToolRegistry` / `ToolDefinition` / `ToolCall` interface; the planning loop calls `complete_with_tools()` and dispatches results identically regardless of tool type.
 
-### External tools (research)
-
-The agent can search and read during planning. Tools are registered per eval; evals that need no research register none.
+### Research tools
 
 | Tool | Purpose | Backend |
 |---|---|---|
@@ -154,7 +184,7 @@ The agent can search and read during planning. Tools are registered per eval; ev
 
 ### Epistemic tools (`KripkeToolset`)
 
-Rather than receiving a pre-baked summary of the world space, the LLM can actively explore its belief state — querying only the hypotheticals it finds relevant. `KripkeToolset` wraps the live `KripkeModel` as a set of callable tools and registers them into the `ToolRegistry` alongside any external tools.
+Rather than receiving a pre-baked summary of the world space, the LLM actively explores its belief state — querying only the hypotheticals it finds relevant.
 
 | Tool | What the LLM can ask |
 |---|---|
@@ -166,16 +196,28 @@ Rather than receiving a pre-baked summary of the world space, the LLM can active
 | `kripke_compare_interventions` | "Which of these two actions is epistemically better?" |
 | `kripke_worlds_reaching_goal` | "How many current worlds already satisfy the goal?" |
 
-The toolset takes a getter `lambda: current_model` so it always reflects the latest model state as the orchestrator processes new observations:
+The toolset takes a getter so it always reflects the latest model state:
 
 ```python
 model_ref = [initial_kripke]
-toolset = KripkeToolset(lambda: model_ref[0])
-toolset.register_all(registry)
+KripkeToolset(lambda: model_ref[0]).register_all(registry)
 
-# When the model updates after an observation:
-model_ref[0] = model_ref[0].update_with_facts(new_facts)
-# All Kripke tools now operate on the updated model automatically
+model_ref[0] = model_ref[0].update_with_facts(new_facts)  # tools update automatically
+```
+
+### Human interface tools
+
+The agent communicates with the human operator using the same tool mechanism — human interactions are first-class and appear in the planning log alongside research and epistemic calls.
+
+| Tool | Behaviour |
+|---|---|
+| `human_notify(message)` | Display a message to the operator; don't wait |
+| `human_ask(question)` | Display a question; block until the operator types a response |
+| `human_confirm(message)` | Display a request; block until the operator types yes/no |
+
+```python
+HumanInterface().register_all(registry)                        # CLI — real operator
+HumanInterface("silent", silent_response="ready").register_all(registry)  # automated / test
 ```
 
 ### Skill library
@@ -184,7 +226,28 @@ model_ref[0] = model_ref[0].update_with_facts(new_facts)
 
 ### Eval specs
 
-`ksp_eval/` (and future eval directories) contain only the **mission instructions and scoring rubric** passed to the agent as its initial prompt. There is no eval-specific agent code. The agent determines what tools and sub-goals are necessary from those instructions alone.
+`ksp_eval/` (and future eval directories) contain only the **mission instructions and scoring rubric** passed to the agent as its initial system prompt. There is no eval-specific agent code. The agent determines what tools and sub-goals are necessary from those instructions alone.
+
+---
+
+## Logging
+
+All LLM completions and tool activity are routed through Python's `logging` module under the `causal_agent` namespace. Call `setup_logging()` once at the top of any entry point.
+
+```python
+from causal_agent import setup_logging
+
+setup_logging("INFO")                        # summaries: model, char counts, tool names
+setup_logging("DEBUG")                       # full prompts, full responses, all tool content
+setup_logging("INFO", log_file="run.log")    # mirror output to a file (append mode)
+```
+
+| Level | What you see |
+|---|---|
+| `DEBUG` | Full prompt text, full response text, all tool arguments and results |
+| `INFO` | Completion summaries (`DeepSeekLLM ← [complete] 3,412 chars`), tool call names, planning iteration counter, final plan char count |
+| `WARNING` | Recoverable issues — replan triggered, max iterations hit |
+| `ERROR` | Unrecoverable failures |
 
 ---
 
@@ -208,7 +271,7 @@ flowchart LR
 
 Here `a` still confuses `w₁` with `w₂`, while `b`'s uncertainty links all three. An **intervention** is modeled by **deleting worlds** and **slicing edges** that contradict new information, then re-evaluating what each `R_a` permits.
 
-The `KripkeToolset` exposes this geometry directly to the LLM as callable tools, so the agent can actively explore the world space during planning rather than receiving a static summary. The epistemic search — which worlds survive a hypothetical? which worlds reach the goal? — is driven by the LLM, not pre-computed by the planner.
+`KripkeToolset` exposes this geometry directly to the LLM as callable tools, so the agent actively explores the world space during planning rather than receiving a static summary. The epistemic search — which worlds survive a hypothetical? which worlds reach the goal? — is driven by the LLM, not pre-computed by the planner.
 
 ---
 
@@ -239,7 +302,7 @@ Control loop for a session — turn order, environment ticks, when to call plann
 Turns high-level decisions into concrete environment actions. `Actor` validates `plan.action_type` against `valid_actions` before emitting a `GameAction`. Post-processor hooks apply environment-specific transforms after validation.
 
 ### 3) Planning
-Reasons over observations and goals to choose what to do next. In the reactive loop, `Planner` calls the LLM with a Kripke summary and memory context. In the planning phase, the same LLM drives an active epistemic search via `KripkeToolset` and any registered external tools.
+Reasons over observations and goals to choose what to do next. In the reactive loop, `Planner` calls the LLM with a Kripke summary and memory context. In the planning phase, `ResearchPlanner` drives an active epistemic and research loop via the full `ToolRegistry`.
 
 ### 4) Feedback
 Closes the loop. `FeedbackProcessor.process()` converts raw environment dicts into typed `FeedbackEvent` objects (`OBSERVATION`, `REWARD`, `PHASE_CHANGE`, `SOCIAL`, `ILLEGAL_MOVE`, `TERMINAL`). The `facts` field on each event is asserted into the KripkeModel.
@@ -249,7 +312,7 @@ What persists within a session and across episodes. `MemoryStore` maintains a bo
 
 A single `MemoryStore` instance should be threaded through the **entire eval** — planning phase, execution phase, and across all attempts. `ResearchPlanner` logs every tool call and the final plan into it; `Orchestrator` logs observations, actions, and feedback. When attempt N fails, the post-mortem is written as a `"reflection"` entry; attempt N+1's planning phase reads `short_term_context()` and skips re-researching what it already knows.
 
-Between attempts, call `memory.summarise_episode(llm)` to compress the full log into a paragraph for seeding the next planning cycle. The `prompt_template` parameter accepts a `{log}` placeholder for eval-specific summarisation instructions.
+Between attempts, call `memory.summarise_episode(llm)` to compress the full log into a paragraph for seeding the next planning cycle. The optional `prompt_template` parameter (with a `{log}` placeholder) allows eval-specific summarisation instructions.
 
 ---
 

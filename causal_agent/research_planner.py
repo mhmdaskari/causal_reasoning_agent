@@ -47,7 +47,7 @@ from causal_agent.llm import BaseLLM
 from causal_agent.memory import MemoryStore, MemoryEntry
 from causal_agent.tools import ToolRegistry, ToolCall, ToolResult
 
-log = logging.getLogger(__name__)
+log = logging.getLogger("causal_agent.research_planner")
 
 
 # ---------------------------------------------------------------------------
@@ -159,7 +159,7 @@ class ResearchPlanner:
                 )
 
         for iterations in range(1, self._max_iter + 1):
-            log.debug("Planning iteration %d", iterations)
+            log.info("── planning iteration %d / %d ──", iterations, self._max_iter)
 
             response = self._llm.complete_with_tools(
                 messages=messages,
@@ -169,6 +169,11 @@ class ResearchPlanner:
 
             if response.is_final:
                 plan_text = response.content or ""
+                log.info(
+                    "planning complete — %d iterations, %d tool calls, %d chars",
+                    iterations, len(tool_call_log), len(plan_text),
+                )
+                log.debug("final plan:\n%s", plan_text)
                 self._mem_write(
                     turn=iterations,
                     kind="plan",
@@ -266,15 +271,13 @@ class ResearchPlanner:
         }
 
     def _log_call(self, tc: ToolCall) -> None:
-        if self._verbose:
-            print(f"  [tool call] {tc.name}({tc.arguments})")
+        log.info("tool call  →  %s(%s)", tc.name, tc.arguments)
 
     def _log_result(self, result: ToolResult) -> None:
-        if self._verbose:
-            preview = result.content[:200].replace("\n", " ")
-            if len(result.content) > 200:
-                preview += "…"
-            print(f"  [tool result] {preview}")
+        preview = result.content[:300].replace("\n", " ")
+        suffix = "…" if len(result.content) > 300 else ""
+        log.info("tool result ←  %s: %s%s", result.name, preview, suffix)
+        log.debug("tool result full ←  %s", result.content)
 
     def _mem_write(
         self,
