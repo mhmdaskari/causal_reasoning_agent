@@ -288,6 +288,27 @@ class WerewolfEnv(GameEnvironment):
     def is_terminal(self) -> bool:
         return self._phase == Phase.ENDED
 
+    # ------------------------------------------------------------------
+    # GameEnvironment optional hooks
+    # ------------------------------------------------------------------
+    #
+    # Werewolf intentionally does NOT override ``tools(agent_id)``. The
+    # canonical Werewolf tools are the Kripke inspection tools
+    # (``KripkeToolset``), which need to read the agent's *running*
+    # epistemic model — and that model lives in the orchestrator, not in
+    # this env. Registering KripkeToolset here would close over a stale
+    # snapshot.
+    #
+    # If a runner wants to expose Kripke tools to the planner for
+    # Werewolf, the runner constructs the ``Planner`` with a
+    # ``ToolRegistry`` that wraps a getter pointing at the orchestrator's
+    # live Kripke model. See ``games/AUTHORING.md`` ("Runner-level tool
+    # registration") for the canonical pattern.
+    #
+    # ``system_prompt()`` is left at its default (``REACTIVE_SYSTEM``),
+    # which is already aligned with hidden-information games such as
+    # Werewolf.
+
     def initial_kripke(self, agent_id: str) -> KripkeModel:
         """
         Build the initial epistemic model for agent_id.

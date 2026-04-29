@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field, create_model
 
 from causal_agent.actions import ActionSpec, _ForbidExtraConfig, string_enum
 from causal_agent.acting import GameAction
+from causal_agent.tools import ToolRegistry
 from games.base import GameEnvironment
 
 
@@ -105,16 +106,62 @@ class Game2048Env(GameEnvironment):
             "terminal": self._terminal,
         }
 
+    # ------------------------------------------------------------------
+    # GameEnvironment optional hooks
+    # ------------------------------------------------------------------
+
+    def system_prompt(self) -> str:
+        from causal_agent.prompts import GAME_2048_SYSTEM
+        return GAME_2048_SYSTEM
+
+    def tools(self, agent_id: str) -> ToolRegistry | None:
+        from causal_agent.game_2048_tools import Game2048Toolset
+
+        registry = ToolRegistry()
+        Game2048Toolset(get_env=lambda: self).register_all(registry)
+        return registry
+
+    def preview(self, agent_id: str, action: GameAction) -> dict | None:
+        """
+        Read-only counterfactual: return the result of sliding without
+        committing. Used by the planner to embed per-direction outcomes
+        in the prompt as a free one-step lookahead.
+        """
+        if self._terminal:
+            return None
+        if action.action_type != "slide":
+            return None
+        direction = str(action.payload.get("direction", ""))
+        legal = self._legal_directions()
+        if direction not in legal:
+            return {
+                "direction": direction,
+                "legal": False,
+                "legal_directions": legal,
+            }
+        moved, gained = self._move(self._board, direction)
+        empty_after = sum(1 for row in moved for v in row if v == 0)
+        max_after = max(max(row) for row in moved)
+        return {
+            "direction": direction,
+            "legal": True,
+            "gained": int(gained),
+            "empty_after": int(empty_after),
+            "max_tile_after": int(max_after),
+        }
+
     def action_specs(self, agent_id: str) -> list[ActionSpec]:
         legal = self._legal_directions()
         if self._terminal or not legal:
             return []
+        # One example per legal direction so the planner's preview hook
+        # can compute outcomes for every candidate slide in one pass.
         return [
             ActionSpec(
                 action_type="slide",
                 description="Slide all tiles in one legal direction.",
                 payload_model=_direction_payload_model(legal),
-                examples=[{"direction": legal[0]}],
+                examples=[{"direction": d} for d in legal],
             )
         ]
 

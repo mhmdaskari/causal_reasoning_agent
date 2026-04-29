@@ -30,13 +30,13 @@ from causal_agent import (
     FeedbackProcessor,
     MemoryEntry,
     MemoryStore,
-    Planner,
 )
 from causal_agent.acting import GameAction
 from evaluations.common import (
     TraceLogger,
     add_llm_args,
     build_llm,
+    build_planner,
     dataclass_to_dict,
     write_summary,
 )
@@ -234,10 +234,11 @@ def run_episode(
         max_attempts=max_attempts,
         secret=secret,
         agent_id="Agent",
+        duplicates_allowed=duplicates_allowed,
     )
     all_codes = generate_all_codes(colors, code_length, duplicates_allowed)
     policy = POLICIES.get(policy_name)
-    planner = Planner(llm, simulate_before_plan=False) if policy_name == "llm" else None
+    planner = build_planner(env, llm, "Agent") if policy_name == "llm" else None
     actor = Actor()
     feedback_processor = FeedbackProcessor()
     memory = MemoryStore(max_short_term=80)

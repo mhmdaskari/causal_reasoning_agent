@@ -14,6 +14,8 @@ from pydantic import BaseModel, Field, create_model
 
 from causal_agent.actions import ActionSpec, _ForbidExtraConfig, string_enum
 from causal_agent.acting import GameAction
+from causal_agent.kripke import KripkeModel, World
+from causal_agent.tools import ToolRegistry
 from games.base import GameEnvironment
 
 
@@ -33,6 +35,7 @@ class MastermindEnv(GameEnvironment):
         seed: int | None = None,
         secret: Sequence[str] | None = None,
         agent_id: str = "Agent",
+        duplicates_allowed: bool = True,
     ) -> None:
         if not colors:
             raise ValueError("Mastermind requires at least one color.")
@@ -40,18 +43,26 @@ class MastermindEnv(GameEnvironment):
             raise ValueError("Mastermind code_length must be positive.")
         if max_attempts < 1:
             raise ValueError("Mastermind max_attempts must be positive.")
+        if not duplicates_allowed and code_length > len(colors):
+            raise ValueError(
+                "code_length cannot exceed colors when duplicates are disabled."
+            )
 
         self._colors = tuple(str(color) for color in colors)
         self._code_length = code_length
         self._max_attempts = max_attempts
         self._rng = random.Random(seed)
         self._agent_id = agent_id
+        self._duplicates_allowed = duplicates_allowed
         self._history: list[dict[str, Any]] = []
         self._solved = False
         self._terminal = False
 
         if secret is None:
-            self._secret = [self._rng.choice(self._colors) for _ in range(code_length)]
+            if duplicates_allowed:
+                self._secret = [self._rng.choice(self._colors) for _ in range(code_length)]
+            else:
+                self._secret = self._rng.sample(list(self._colors), k=code_length)
         else:
             self._secret = [str(color) for color in secret]
             self._validate_code(self._secret)
@@ -145,6 +156,63 @@ class MastermindEnv(GameEnvironment):
                 examples=[{"code": example}],
             )
         ]
+
+    # ------------------------------------------------------------------
+    # GameEnvironment optional hooks
+    # ------------------------------------------------------------------
+
+    def system_prompt(self) -> str:
+        from causal_agent.prompts import MASTERMIND_SYSTEM
+        return MASTERMIND_SYSTEM
+
+    def tools(self, agent_id: str) -> ToolRegistry | None:
+        from causal_agent.mastermind_tools import MastermindToolset
+
+        registry = ToolRegistry()
+        MastermindToolset(
+            get_env=lambda: self,
+            duplicates_allowed=self._duplicates_allowed,
+        ).register_all(registry)
+        return registry
+
+    def initial_kripke(self, agent_id: str) -> KripkeModel:
+        """
+        Build a meaningful Kripke model for Mastermind: one world per
+        candidate secret code. Each world is identified by a deterministic
+        id (``c0``, ``c1``, …). Worlds are filtered by
+        ``update_with_facts(...)`` as feedback narrows the candidate set
+        — but in practice the dedicated ``MastermindToolset`` is what the
+        LLM should use; this Kripke model is mostly here so the framework
+        can also be exercised via ``KripkeToolset`` for debugging or
+        comparison.
+
+        The world space size is C(N,k) (no dups) or N**k (dups), where N
+        is the palette size and k the code length. We cap at a fixed limit
+        to avoid pathological sizes; if the cap is exceeded we keep a
+        sample plus a synthetic ``other`` world so update logic still
+        terminates.
+        """
+        from itertools import permutations, product
+
+        max_worlds = 4096
+
+        if self._duplicates_allowed:
+            generator = product(self._colors, repeat=self._code_length)
+        else:
+            generator = permutations(self._colors, self._code_length)
+
+        worlds: list[World] = []
+        for i, code in enumerate(generator):
+            if i >= max_worlds:
+                break
+            worlds.append(
+                World.from_dict(
+                    f"c{i}",
+                    {f"pos_{p}": color for p, color in enumerate(code)},
+                )
+            )
+
+        return KripkeModel(worlds=worlds)
 
     @property
     def is_terminal(self) -> bool:
