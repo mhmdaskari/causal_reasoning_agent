@@ -3,7 +3,8 @@ examples/run_werewolf.py
 
 End-to-end demo: one AI agent playing Werewolf with MockLLM (no API key needed).
 
-Swap MockLLM for OpenAILLM, AnthropicLLM, or GeminiLLM to use a real backend.
+Swap MockLLM for OpenAILLM, AnthropicLLM, GeminiLLM, or DeepSeekLLM to use a
+real backend.
 
 Usage
 -----
@@ -11,6 +12,7 @@ Usage
     python -m examples.run_werewolf --model openai --openai-key sk-...
     python -m examples.run_werewolf --model anthropic --anthropic-key sk-ant-...
     python -m examples.run_werewolf --model gemini --gemini-key AIza...
+    python -m examples.run_werewolf --model deepseek --deepseek-key <key>
 """
 
 from __future__ import annotations
@@ -33,6 +35,7 @@ from causal_agent import (
     AgentConfig,
     Actor,
     AnthropicLLM,
+    DeepSeekLLM,
     FeedbackProcessor,
     GeminiLLM,
     MemoryStore,
@@ -40,6 +43,7 @@ from causal_agent import (
     OpenAILLM,
     Orchestrator,
     Planner,
+    setup_logging,
 )
 from games.werewolf import WerewolfEnv
 
@@ -58,6 +62,9 @@ def build_llm(args: argparse.Namespace):
     if args.model == "gemini":
         print(f"[llm] Using Gemini ({args.gemini_model})")
         return GeminiLLM(model=args.gemini_model, api_key=args.gemini_key)
+    if args.model == "deepseek":
+        print(f"[llm] Using DeepSeek ({args.deepseek_model})")
+        return DeepSeekLLM(model=args.deepseek_model, api_key=args.deepseek_key)
     print("[llm] Using MockLLM (no API calls)")
     return MockLLM()
 
@@ -67,6 +74,8 @@ def build_llm(args: argparse.Namespace):
 # ---------------------------------------------------------------------------
 
 def run(args: argparse.Namespace) -> None:
+    setup_logging("INFO")
+
     players = ["Agent", "Alice", "Bob", "Charlie", "Dave"]
     agent_id = "Agent"
 
@@ -144,13 +153,15 @@ def run(args: argparse.Namespace) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Werewolf demo for causal_agent framework.")
-    p.add_argument("--model", choices=["mock", "openai", "anthropic", "gemini"], default="mock")
+    p.add_argument("--model", choices=["mock", "openai", "anthropic", "gemini", "deepseek"], default="mock")
     p.add_argument("--openai-key", default=None)
     p.add_argument("--openai-model", default="gpt-4o")
     p.add_argument("--anthropic-key", default=None)
     p.add_argument("--anthropic-model", default="claude-3-5-sonnet-20241022")
     p.add_argument("--gemini-key", default=None)
     p.add_argument("--gemini-model", default="gemini-2.0-flash")
+    p.add_argument("--deepseek-key", default=None)
+    p.add_argument("--deepseek-model", default="deepseek-chat")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
 
